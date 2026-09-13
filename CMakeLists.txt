@@ -20,3 +20,7 @@ add_test(NAME engine_tests COMMAND engine_tests)
 add_executable(cli_tests tests/cli_tests.cpp)
 target_include_directories(cli_tests PRIVATE include tests)
 add_test(NAME cli_tests COMMAND cli_tests)
+
+add_executable(state_tests tests/state_tests.cpp)
+target_include_directories(state_tests PRIVATE include tests)
+add_test(NAME state_tests COMMAND state_tests)
