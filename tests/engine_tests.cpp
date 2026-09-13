@@ -83,6 +83,67 @@ void amendment_tests() {
     r = middle.market(Side::Sell, 2);
     CHECK(r.trades[0].buy_id == x && r.trades[1].buy_id == z);
 }
+void peg_tests() {
+    Engine e;
+    const auto low = e.limit(Side::Buy, 999, 100).id;
+    const auto bid = e.limit(Side::Buy, 1000, 200).id;
+    e.limit(Side::Sell, 1050, 100);
+    const auto peg = e.peg(Kind::PegBid, Side::Buy, 150).id;
+    CHECK(e.snapshot(Side::Buy)[0].id == bid && e.snapshot(Side::Buy)[1].id == peg);
+    const auto better = e.limit(Side::Buy, 1010, 300).id;
+    auto rows = e.snapshot(Side::Buy);
+    CHECK(rows[0].id == peg && rows[1].id == better && rows[2].id == bid);
+    CHECK(rows[0].price == 1010);
+    e.cancel(better);
+    CHECK(e.find(peg)->price == 1000);
+    e.cancel(bid);
+    CHECK(e.find(peg)->price == 999);
+    e.cancel(low);
+    CHECK(!e.find(peg)->price && e.suspended().size() == 1);
+    CHECK(e.market(Side::Sell, 10).unfilled == 10);
+    const auto revived = e.limit(Side::Buy, 980, 50).id;
+    CHECK(e.snapshot(Side::Buy)[0].id == peg && e.find(peg)->price == 980);
+    e.amend(peg, {}, 200);
+    CHECK(e.snapshot(Side::Buy)[0].id == revived);
+    rejects([&] { (void)e.amend(peg, 990, {}); });
+    e.cancel(peg);
+    CHECK(!e.find(peg));
+    Engine offer;
+    const auto anchor = offer.limit(Side::Sell, 1100, 1).id;
+    const auto op = offer.peg(Kind::PegOffer, Side::Sell, 3).id;
+    const auto newer = offer.limit(Side::Sell, 1090, 2).id;
+    CHECK(offer.snapshot(Side::Sell)[0].id == op);
+    offer.cancel(newer);
+    auto r = offer.market(Side::Buy, 4);
+    CHECK(r.trades.size() == 1 && r.trades[0].sell_id == anchor && r.unfilled == 3);
+    CHECK(!offer.find(op)->price); // anchor disappears BEFORE next fill
+    Engine opposite;
+    opposite.limit(Side::Sell, 1050, 5);
+    r = opposite.peg(Kind::PegOffer, Side::Buy, 7);
+    CHECK(r.trades.size() == 1 && r.trades[0].qty == 5 && r.trades[0].price == 1050);
+    CHECK(opposite.find(r.id)->remaining == 2 && !opposite.find(r.id)->price);
+    Engine suspended;
+    const auto p1 = suspended.peg(Kind::PegBid, Side::Sell, 2).id;
+    const auto p2 = suspended.peg(Kind::PegOffer, Side::Buy, 2).id;
+    CHECK(suspended.suspended().size() == 2);
+    r = suspended.limit(Side::Buy, 1000, 3);
+    CHECK(r.trades.size() == 1 && r.trades[0].sell_id == p1);
+    CHECK(!suspended.find(p1) && suspended.find(p2));
+    suspended.cancel(p2);
+    Engine repriced;
+    repriced.limit(Side::Buy, 1000, 100);
+    const auto moving = repriced.peg(Kind::PegBid, Side::Buy, 10).id;
+    repriced.limit(Side::Sell, 1500, 10);
+    r = repriced.limit(Side::Buy, 2000, 100);
+    CHECK(r.trades.size() == 1 && r.trades[0].buy_id == moving);
+    CHECK(r.trades[0].price == 1500); // existing ask, NOT the peg's new bid of 2000
+    Engine multi;
+    const auto old = multi.peg(Kind::PegBid, Side::Buy, 1).id;
+    const auto next = multi.peg(Kind::PegBid, Side::Buy, 1).id;
+    multi.limit(Side::Buy, 1000, 3);
+    r = multi.market(Side::Sell, 2);
+    CHECK(r.trades[0].buy_id == old && r.trades[1].buy_id == next);
+}
 
 void extra_numeric_tests() {
     CHECK(parse_qty("9223372036854775807") == std::numeric_limits<Qty>::max());
@@ -169,6 +230,43 @@ void extra_amendment_tests() {
     rejects([&] { (void)engine.amend(second, {}, 10); });
 }
 
+void extra_peg_tests() {
+    for (Side side : {Side::Buy, Side::Sell}) {
+        Engine engine;
+        const Kind kind = side == Side::Buy ? Kind::PegBid : Kind::PegOffer;
+        const auto anchor1 = engine.limit(side, 1000, 2).id;
+        const auto anchor2 = engine.limit(side, 1000, 3).id;
+        const auto peg = engine.peg(kind, side, 4).id;
+        engine.cancel(anchor1);
+        CHECK(engine.find(peg)->price == 1000); // Duplicate anchor must survive.
+        engine.cancel(anchor2);
+        CHECK(!engine.find(peg)->price);
+        CHECK(engine.suspended().size() == 1);
+
+        engine.amend(peg, {}, 5);
+        CHECK(engine.find(peg)->remaining == 5 && !engine.find(peg)->price);
+        const auto new_anchor = engine.limit(side, 900, 1).id;
+        const auto active = engine.snapshot(side);
+        CHECK(active.size() == 2 && active[0].id == peg && active[1].id == new_anchor);
+    }
+
+    Engine repriced_sell;
+    repriced_sell.limit(Side::Sell, 2000, 100);
+    const auto peg = repriced_sell.peg(Kind::PegOffer, Side::Sell, 10).id;
+    repriced_sell.limit(Side::Buy, 1500, 10);
+    const auto result = repriced_sell.limit(Side::Sell, 1000, 100);
+    CHECK(result.trades.size() == 1 && result.trades[0].sell_id == peg);
+    CHECK(result.trades[0].price == 1500); // Existing bid supplies execution price.
+
+    Engine across;
+    across.limit(Side::Buy, 1000, 5);
+    const auto sell = across.peg(Kind::PegBid, Side::Sell, 7);
+    CHECK(sell.trades.size() == 1 && sell.trades[0].qty == 5);
+    CHECK(sell.trades[0].price == 1000);
+    CHECK(across.find(sell.id)->remaining == 2 && !across.find(sell.id)->price);
+    rejects([&] { (void)across.peg(Kind::Limit, Side::Buy, 1); });
+}
+
 int main() {
     try {
         numeric_tests();
@@ -177,6 +275,8 @@ int main() {
         extra_matching_tests();
         amendment_tests();
         extra_amendment_tests();
+        peg_tests();
+        extra_peg_tests();
         std::cout << "All tests passed\n";
         return 0;
     } catch (const std::exception &error) {

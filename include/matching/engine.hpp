@@ -35,6 +35,52 @@ class Engine {
     Id next_id_ = 1;
     Sequence next_sequence_ = 1;
 
+    std::multiset<Price> fixed_bids_;
+    std::multiset<Price> fixed_asks_;
+    std::set<Id> pegs_;
+
+    std::multiset<Price> &anchors(Side side) {
+        return side == Side::Buy ? fixed_bids_ : fixed_asks_;
+    }
+
+    std::optional<Price> reference(Kind kind) const {
+        if (kind == Kind::PegBid) {
+            if (fixed_bids_.empty()) {
+                return std::nullopt;
+            }
+            return *fixed_bids_.rbegin();
+        }
+        if (fixed_asks_.empty()) {
+            return std::nullopt;
+        }
+        return *fixed_asks_.begin();
+    }
+
+    void refresh_pegs() {
+        // Pegs never anchor other pegs; these references cannot change in this loop.
+        const auto bid = reference(Kind::PegBid);
+        const auto offer = reference(Kind::PegOffer);
+
+        for (Id id : pegs_) {
+            auto &order = orders_.at(id);
+            const auto new_price = order.kind == Kind::PegBid ? bid : offer;
+            if (order.price == new_price) {
+                continue;
+            }
+
+            const auto activation = allocate_sequence();
+            if (order.price) {
+                book(order.side).erase(entry(order));
+            }
+            order.price = new_price;
+            order.working_sequence = activation;
+            // Keep sequence: automatic repricing preserves FIFO priority.
+            if (order.price) {
+                book(order.side).insert(entry(order));
+            }
+        }
+    }
+
     Book &book(Side side) {
         return side == Side::Buy ? bids_ : asks_;
     }
@@ -65,11 +111,22 @@ class Engine {
         if (order.price) {
             book(order.side).insert(entry(order));
         }
+        if (order.kind == Kind::Limit) {
+            anchors(order.side).insert(*order.price);
+        } else {
+            pegs_.insert(order.id);
+        }
     }
 
     void detach(const Order &order) {
         if (order.price) {
             book(order.side).erase(entry(order));
+        }
+        if (order.kind == Kind::Limit) {
+            auto &prices = anchors(order.side);
+            prices.erase(prices.find(*order.price)); // Remove exactly one anchor.
+        } else {
+            pegs_.erase(order.id);
         }
     }
 
@@ -88,6 +145,7 @@ class Engine {
     }
 
     void settle(std::vector<Trade> &trades) {
+        refresh_pegs();
         while (!bids_.empty() && !asks_.empty() && bids_.begin()->price >= asks_.begin()->price) {
             // Copies survive removal of fully filled orders by consume().
             const auto buy = orders_.at(bids_.begin()->id);
@@ -99,6 +157,7 @@ class Engine {
             trades.push_back({price, filled, buy.id, sell.id});
             consume(buy.id, filled);
             consume(sell.id, filled);
+            refresh_pegs();
         }
     }
 
@@ -136,8 +195,28 @@ public:
             result.trades.push_back({*resting.price, filled, buy_id, sell_id});
             consume(resting.id, filled);
             qty -= filled;
+            settle(result.trades);
         }
         result.unfilled = qty; // Discarded: a market order never rests in the book.
+        return result;
+    }
+
+    Result peg(Kind kind, Side side, Qty qty) {
+        validate_side(side);
+        positive(qty);
+        if (kind != Kind::PegBid && kind != Kind::PegOffer) {
+            throw std::invalid_argument("invalid peg reference");
+        }
+
+        const auto sequence = allocate_sequence();
+        const auto id = allocate_id();
+        const Order order{id, side, kind, reference(kind), qty, sequence, sequence};
+        orders_.emplace(id, order);
+        attach(order);
+
+        Result result;
+        result.id = id;
+        settle(result.trades);
         return result;
     }
 
@@ -166,6 +245,9 @@ public:
         }
         if (qty) {
             positive(*qty);
+        }
+        if (price && old->kind != Kind::Limit) {
+            throw std::invalid_argument("pegged price is automatic");
         }
 
         Order updated = *old;
@@ -207,6 +289,17 @@ public:
         result.reserve(book(side).size());
         for (const auto &item : book(side)) {
             result.push_back(orders_.at(item.id));
+        }
+        return result;
+    }
+
+    std::vector<Order> suspended() const {
+        std::vector<Order> result;
+        for (Id id : pegs_) {
+            const auto &order = orders_.at(id);
+            if (!order.price) {
+                result.push_back(order);
+            }
         }
         return result;
     }
