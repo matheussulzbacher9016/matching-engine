@@ -16,3 +16,7 @@ enable_testing()
 add_executable(engine_tests tests/engine_tests.cpp)
 target_include_directories(engine_tests PRIVATE include tests)
 add_test(NAME engine_tests COMMAND engine_tests)
+
+add_executable(cli_tests tests/cli_tests.cpp)
+target_include_directories(cli_tests PRIVATE include tests)
+add_test(NAME cli_tests COMMAND cli_tests)

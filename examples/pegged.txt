@@ -1,0 +1,7 @@
+limit buy 10 200
+limit buy 9.99 100
+limit sell 10.5 100
+peg bid buy 150
+print book
+limit buy 10.1 300
+print book
