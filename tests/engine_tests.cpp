@@ -47,6 +47,42 @@ void matching_tests() {
     rejects([&] { (void)sell.limit(Side::Buy, 0, 1); });
     rejects([&] { (void)sell.market(Side::Buy, -1); });
 }
+void amendment_tests() {
+    Engine e;
+    const auto first = e.limit(Side::Buy, 1000, 200).id;
+    const auto second = e.limit(Side::Buy, 999, 100).id;
+    e.amend(first, 998, std::nullopt);
+    CHECK(e.snapshot(Side::Buy)[0].id == second);
+    CHECK(e.snapshot(Side::Buy)[1].id == first);
+    e.cancel(second);
+    CHECK(!e.find(second));
+    rejects([&] { (void)e.cancel(second); });
+    rejects([&] { (void)e.amend(first, 1000, 0); });
+    CHECK(e.find(first)->price == 998 && e.find(first)->remaining == 200);
+    rejects([&] { (void)e.amend(first, {}, {}); });
+    Engine fifo;
+    const auto a = fifo.limit(Side::Sell, 1000, 10).id;
+    const auto b = fifo.limit(Side::Sell, 1000, 10).id;
+    fifo.amend(a, {}, 5); // reduction retains priority
+    CHECK(fifo.snapshot(Side::Sell)[0].id == a);
+    fifo.amend(a, {}, 6); // increase loses priority
+    CHECK(fifo.snapshot(Side::Sell)[0].id == b);
+    auto r = fifo.amend(a, 900, 3);
+    CHECK(r.trades.empty() && fifo.snapshot(Side::Sell)[0].id == a);
+    const auto buy = fifo.limit(Side::Buy, 800, 5).id;
+    r = fifo.amend(buy, 900, {});
+    CHECK(r.trades.size() == 1 && r.trades[0].price == 900 && r.trades[0].qty == 3);
+    CHECK(fifo.find(buy)->remaining == 2);
+    fifo.cancel(buy);
+    CHECK(!fifo.find(buy));
+    Engine middle;
+    const auto x = middle.limit(Side::Buy, 100, 1).id;
+    const auto y = middle.limit(Side::Buy, 100, 1).id;
+    const auto z = middle.limit(Side::Buy, 100, 1).id;
+    middle.cancel(y);
+    r = middle.market(Side::Sell, 2);
+    CHECK(r.trades[0].buy_id == x && r.trades[1].buy_id == z);
+}
 
 void extra_numeric_tests() {
     CHECK(parse_qty("9223372036854775807") == std::numeric_limits<Qty>::max());
@@ -101,12 +137,46 @@ void extra_matching_tests() {
     CHECK(swept.unfilled == 0);
 }
 
+void extra_amendment_tests() {
+    Engine engine;
+    const auto first = engine.limit(Side::Sell, 1000, 100).id;
+    const auto second = engine.limit(Side::Sell, 1000, 50).id;
+    engine.market(Side::Buy, 40);
+    CHECK(engine.find(first)->remaining == 60);
+    const auto priority = engine.find(first)->sequence;
+
+    engine.amend(first, 1000, 60);
+    CHECK(engine.find(first)->sequence == priority); // No-op.
+    engine.amend(first, {}, 59);
+    CHECK(engine.find(first)->sequence == priority); // Reduction only.
+    engine.amend(first, {}, 70);
+    CHECK(engine.find(first)->remaining == 70); // Not 100 - 40 or 59 + 70.
+    CHECK(engine.find(first)->sequence > engine.find(second)->sequence);
+
+    const auto before = *engine.find(first);
+    rejects([&] { (void)engine.amend(first, -1, 20); });
+    rejects([&] { (void)engine.amend(first, 500, 0); });
+    CHECK(engine.find(first)->price == before.price);
+    CHECK(engine.find(first)->remaining == before.remaining);
+    CHECK(engine.find(first)->sequence == before.sequence);
+
+    engine.cancel(first);
+    const auto result = engine.market(Side::Buy, 100);
+    CHECK(result.trades.size() == 1);
+    CHECK(result.trades[0].sell_id == second);
+    CHECK(result.unfilled == 50);
+    rejects([&] { (void)engine.cancel(second); }); // Already fully executed.
+    rejects([&] { (void)engine.amend(second, {}, 10); });
+}
+
 int main() {
     try {
         numeric_tests();
         extra_numeric_tests();
         matching_tests();
         extra_matching_tests();
+        amendment_tests();
+        extra_amendment_tests();
         std::cout << "All tests passed\n";
         return 0;
     } catch (const std::exception &error) {

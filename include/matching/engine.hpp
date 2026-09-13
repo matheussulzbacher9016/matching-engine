@@ -141,6 +141,58 @@ public:
         return result;
     }
 
+    Result cancel(Id id) {
+        if (!find(id)) {
+            throw std::invalid_argument("unknown order ID");
+        }
+        erase_order(id);
+
+        Result result;
+        result.id = id;
+        settle(result.trades);
+        return result;
+    }
+
+    Result amend(Id id, std::optional<Price> price, std::optional<Qty> qty) {
+        const auto old = find(id);
+        if (!old) {
+            throw std::invalid_argument("unknown order ID");
+        }
+        if (!price && !qty) {
+            throw std::invalid_argument("no amendment fields");
+        }
+        if (price) {
+            positive(*price);
+        }
+        if (qty) {
+            positive(*qty);
+        }
+
+        Order updated = *old;
+        if (price) {
+            updated.price = *price;
+        }
+        if (qty) {
+            updated.remaining = *qty; // New remaining quantity, not an increment.
+        }
+        const bool loses_priority =
+            updated.price != old->price || updated.remaining > old->remaining;
+        if (loses_priority) {
+            updated.sequence = allocate_sequence();
+            updated.working_sequence = updated.sequence;
+        }
+
+        // Invalid user input has been rejected before modifying any index.
+        detach(*old);
+        orders_.at(id) = updated;
+        attach(updated);
+
+        Result result;
+        result.id = id;
+        settle(result.trades);
+        return result;
+    }
+
     std::optional<Order> find(Id id) const {
         const auto iterator = orders_.find(id);
         if (iterator == orders_.end()) {
